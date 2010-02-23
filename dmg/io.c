@@ -7,6 +7,7 @@
 #include <inttypes.h>
 
 #define SECTORS_AT_A_TIME 0x200
+#define IGNORE_THRESHOLD  SECTORS_AT_A_TIME * 2
 
 // Okay, this value sucks. You shouldn't touch it because it affects how many ignore sections get added to the blkx list
 // If the blkx list gets too fragmented with ignore sections, then the copy list in certain versions of the iPhone's
@@ -19,6 +20,8 @@
 // There's always a large-ish one at the end, and a tiny 2 sector one at the end too, to take care of the space after
 // the backup volume header. No frakking clue how they go about determining how to do that.
 
+// I've done some tweaks, to make algorithm to act more closer to Apple // Vortex
+
 BLKXTable* insertBLKX(AbstractFile* out, AbstractFile* in, uint32_t firstSectorNumber, uint32_t numSectors, uint32_t blocksDescriptor,
 			uint32_t checksumType, ChecksumFunc uncompressedChk, void* uncompressedChkToken, ChecksumFunc compressedChk,
 			void* compressedChkToken, Volume* volume, int addComment) {
@@ -27,6 +30,7 @@ BLKXTable* insertBLKX(AbstractFile* out, AbstractFile* in, uint32_t firstSectorN
 	uint32_t roomForRuns;
 	uint32_t curRun;
 	uint64_t curSector;
+	uint64_t curOff;
 	
 	unsigned char* inBuffer;
 	unsigned char* outBuffer;
@@ -34,8 +38,6 @@ BLKXTable* insertBLKX(AbstractFile* out, AbstractFile* in, uint32_t firstSectorN
 	size_t have;
 	int ret;
 	
-	int IGNORE_THRESHOLD = 100000;
-
 	z_stream strm;	
 	
 	blkx = (BLKXTable*) malloc(sizeof(BLKXTable) + (2 * sizeof(BLKXRun)));
@@ -102,6 +104,8 @@ BLKXTable* insertBLKX(AbstractFile* out, AbstractFile* in, uint32_t firstSectorN
 		strm.zfree = Z_NULL;
 		strm.opaque = Z_NULL;
 		
+		curOff = startOff + (blkx->sectorCount - numSectors) * SECTOR_SIZE;
+
 		int amountRead;
 		{
 			size_t sectorsToSkip = 0;
@@ -111,7 +115,7 @@ BLKXTable* insertBLKX(AbstractFile* out, AbstractFile* in, uint32_t firstSectorN
 			{
 				blkx->runs[curRun].sectorCount = ((numSectors - processed) > SECTORS_AT_A_TIME) ? SECTORS_AT_A_TIME : (numSectors - processed);
 
-				//printf("Currently at %" PRId64 "\n", curOff);
+                                //printf("Currently at %" PRId64 "\n", curOff);
 				in->seek(in, startOff + (blkx->sectorCount - numSectors + processed) * SECTOR_SIZE);
 				ASSERT((amountRead = in->read(in, inBuffer, blkx->runs[curRun].sectorCount * SECTOR_SIZE)) == (blkx->runs[curRun].sectorCount * SECTOR_SIZE), "mRead");
 
@@ -138,62 +142,40 @@ BLKXTable* insertBLKX(AbstractFile* out, AbstractFile* in, uint32_t firstSectorN
 
 				if(counter < counter_max)
 				{
-					if(sectorsToSkip > IGNORE_THRESHOLD)
+					if(sectorsToSkip < IGNORE_THRESHOLD)
 					{
-						//printf("Seeking back to %" PRId64 "\n", curOff + (skipInBuffer * SECTOR_SIZE));
-						//in->seek(in, curOff + (skipInBuffer * SECTOR_SIZE));
-					} else {
-						//printf("Breaking out: %d / %d\n", (size_t) counter, (size_t) counter_max);
-					}
+						blkx->runs[curRun].sectorCount = (numSectors > SECTORS_AT_A_TIME) ? SECTORS_AT_A_TIME : numSectors;
+						in->seek(in, curOff);
+						ASSERT((amountRead = in->read(in, inBuffer, blkx->runs[curRun].sectorCount * SECTOR_SIZE)) == (blkx->runs[curRun].sectorCount * SECTOR_SIZE), "mRead");
+					};
 					break;
 				}
 			}
 
-			if(sectorsToSkip > IGNORE_THRESHOLD)
+			if(sectorsToSkip >= IGNORE_THRESHOLD)
 			{
-				int remainder = sectorsToSkip & 0xf;
+				blkx->runs[curRun].type = BLOCK_IGNORE;
+				blkx->runs[curRun].reserved = 0;
+				blkx->runs[curRun].sectorStart = curSector;
+				blkx->runs[curRun].sectorCount = sectorsToSkip;
+				blkx->runs[curRun].compOffset = out->tell(out) - blkx->dataStart;
+				blkx->runs[curRun].compLength = 0;
 
-				if(sectorsToSkip != remainder)
-				{
-					blkx->runs[curRun].type = BLOCK_IGNORE;
-					blkx->runs[curRun].reserved = 0;
-					blkx->runs[curRun].sectorStart = curSector;
-					blkx->runs[curRun].sectorCount = sectorsToSkip - remainder;
-					blkx->runs[curRun].compOffset = out->tell(out) - blkx->dataStart;
-					blkx->runs[curRun].compLength = 0;
+				printf("run %d: skipping sectors=%" PRId64 ", left=%d\n", curRun, (int64_t) sectorsToSkip, numSectors);
 
-					printf("run %d: skipping sectors=%" PRId64 ", left=%d\n", curRun, (int64_t) sectorsToSkip, numSectors);
-
-					curSector += blkx->runs[curRun].sectorCount;
-					numSectors -= blkx->runs[curRun].sectorCount;
-
-					curRun++;
+				curSector += blkx->runs[curRun].sectorCount;
+				numSectors -= blkx->runs[curRun].sectorCount;
+				curRun++;
+				if(curRun >= roomForRuns) {
+					roomForRuns <<= 1;
+					blkx = (BLKXTable*) realloc(blkx, sizeof(BLKXTable) + (roomForRuns * sizeof(BLKXRun)));
 				}
 
-				if(remainder > 0)
-				{
-					blkx->runs[curRun].type = BLOCK_IGNORE;
-					blkx->runs[curRun].reserved = 0;
-					blkx->runs[curRun].sectorStart = curSector;
-					blkx->runs[curRun].sectorCount = remainder;
-					blkx->runs[curRun].compOffset = out->tell(out) - blkx->dataStart;
-					blkx->runs[curRun].compLength = 0;
-
-					printf("run %d: skipping sectors=%" PRId64 ", left=%d\n", curRun, (int64_t) sectorsToSkip, numSectors);
-
-					curSector += blkx->runs[curRun].sectorCount;
-					numSectors -= blkx->runs[curRun].sectorCount;
-
-					curRun++;
-				}
-
-				IGNORE_THRESHOLD = 0;
-				
 				continue;
 			}
 		}
 
-		printf("run %d: sectors=%" PRId64 ", left=%d\n", curRun, blkx->runs[curRun].sectorCount, numSectors);
+                printf("run %d: sectors=%" PRId64 ", left=%d\n", curRun, blkx->runs[curRun].sectorCount, numSectors);
 
 		ASSERT(deflateInit(&strm, 1) == Z_OK, "deflateInit");
 		
@@ -216,7 +198,7 @@ BLKXTable* insertBLKX(AbstractFile* out, AbstractFile* in, uint32_t firstSectorN
 		have = bufferSize - strm.avail_out;
 		
 		if((have / SECTOR_SIZE) >= (blkx->runs[curRun].sectorCount - 15)) {
-			blkx->runs[curRun].type = BLOCK_RAW;
+                        blkx->runs[curRun].type = BLOCK_RAW;
 			ASSERT(out->write(out, inBuffer, blkx->runs[curRun].sectorCount * SECTOR_SIZE) == (blkx->runs[curRun].sectorCount * SECTOR_SIZE), "fwrite");
 			blkx->runs[curRun].compLength += blkx->runs[curRun].sectorCount * SECTOR_SIZE;
 
