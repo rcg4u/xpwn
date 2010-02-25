@@ -222,6 +222,23 @@ void cmd_grow(Volume* volume, int argc, const char *argv[]) {
 	printf("grew volume: %" PRId64 "\n", newSize);
 }
 
+void cmd_untar(Volume* volume, int argc, const char *argv[]) {
+	AbstractFile *inFile;
+	
+	if(argc < 2) {
+		printf("Not enough arguments");
+		return;
+	}
+	
+	inFile = createAbstractFileFromFile(fopen(argv[1], "rb"));
+	
+	if(inFile == NULL) {
+		printf("file to untar not found");
+	}
+	
+	hfs_untar(volume, inFile);
+}
+
 void cmd_getattr(Volume* volume, int argc, const char *argv[]) {
 	HFSPlusCatalogRecord* record;
 
@@ -271,7 +288,7 @@ int main(int argc, const char *argv[]) {
 	TestByteOrder();
 	
 	if(argc < 3) {
-		printf("usage: %s <image-file> <ls|cat|mv|mkdir|add|rm|chmod|extract|extractall|rmall|addall|debug> <arguments>\n", argv[0]);
+		printf("usage: %s <image-file> <ls|cat|mv|mkdir|add|rm|chmod|extract|extractall|rmall|addall|debug|symlink|getattr|grow|untar> <arguments>\n", argv[0]);
 		return 0;
 	}
 	
@@ -315,6 +332,8 @@ int main(int argc, const char *argv[]) {
 			cmd_addall(volume, argc - 2, argv + 2);
 		} else if(strcmp(argv[2], "grow") == 0) {
 			cmd_grow(volume, argc - 2, argv + 2);
+		} else if(strcmp(argv[2], "untar") == 0) {
+			cmd_untar(volume, argc - 2, argv + 2);
 		} else if(strcmp(argv[2], "getattr") == 0) {
 			cmd_getattr(volume, argc - 2, argv + 2);
 		} else if(strcmp(argv[2], "debug") == 0) {
