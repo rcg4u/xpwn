@@ -1,503 +1,723 @@
-#include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#include <dirent.h>
+#include <time.h>
+#include <sys/types.h>
+#include "common.h"
 #include <hfs/hfsplus.h>
+#include <hfs/hfscompress.h>
+#include "abstractfile.h"
+#include <sys/stat.h>
+#include <inttypes.h>
 
-int writeExtents(RawFile* rawFile);
+#define BUFSIZE 1024*1024
 
-int isBlockUsed(Volume* volume, uint32_t block)
-{
-	unsigned char byte;
+static int silence = 0;
 
-	READ(volume->allocationFile, block / 8, 1, &byte);
-	return (byte & (1 << (7 - (block % 8)))) != 0;
+void hfs_setsilence(int s) {
+	silence = s;
 }
 
-int setBlockUsed(Volume* volume, uint32_t block, int used) {
-	unsigned char byte;
-
-	READ(volume->allocationFile, block / 8, 1, &byte);
-	if(used) {
-		byte |= (1 << (7 - (block % 8)));
-	} else {
-		byte &= ~(1 << (7 - (block % 8)));
-	}
-	ASSERT(WRITE(volume->allocationFile, block / 8, 1, &byte), "WRITE");
-
-	return TRUE;
-}
-
-int allocate(RawFile* rawFile, off_t size) {
-	unsigned char* zeros;
-	Volume* volume;
-	HFSPlusForkData* forkData;
-	uint32_t blocksNeeded;
-	uint32_t blocksToAllocate;
-	Extent* extent;
-	Extent* lastExtent;
-
-	uint32_t curBlock;
-
-	volume = rawFile->volume;
-	forkData = rawFile->forkData;
-	extent = rawFile->extents;
-
-	blocksNeeded = ((uint64_t)size / (uint64_t)volume->volumeHeader->blockSize) + (((size % volume->volumeHeader->blockSize) == 0) ? 0 : 1);
-
-	if(blocksNeeded > forkData->totalBlocks) {
-		zeros = (unsigned char*) malloc(volume->volumeHeader->blockSize);
-		memset(zeros, 0, volume->volumeHeader->blockSize);
-
-		blocksToAllocate = blocksNeeded - forkData->totalBlocks;
-
-		if(blocksToAllocate > volume->volumeHeader->freeBlocks) {
-			return FALSE;
-		}
-
-		lastExtent = NULL;
-		while(extent != NULL) {
-			lastExtent = extent;
-			extent = extent->next;
-		}
-
-		if(lastExtent == NULL) {
-			rawFile->extents = (Extent*) malloc(sizeof(Extent));
-			lastExtent = rawFile->extents;
-			lastExtent->blockCount = 0;
-			lastExtent->next = NULL;
-			curBlock = volume->volumeHeader->nextAllocation;
-		} else {
-			curBlock = lastExtent->startBlock + lastExtent->blockCount;
-		}
-
-		while(blocksToAllocate > 0) {
-			if(isBlockUsed(volume, curBlock)) {
-				if(lastExtent->blockCount > 0) {
-					lastExtent->next = (Extent*) malloc(sizeof(Extent));
-					lastExtent = lastExtent->next;
-					lastExtent->blockCount = 0;
-					lastExtent->next = NULL;
-				}
-				curBlock = volume->volumeHeader->nextAllocation;
-				volume->volumeHeader->nextAllocation++;
-				if(volume->volumeHeader->nextAllocation >= volume->volumeHeader->totalBlocks) {
-					volume->volumeHeader->nextAllocation = 0;
-				}
-			} else {
-				if(lastExtent->blockCount == 0) {
-					lastExtent->startBlock = curBlock;
-				}
-
-				/* zero out allocated block */
-				ASSERT(WRITE(volume->image, curBlock * volume->volumeHeader->blockSize, volume->volumeHeader->blockSize, zeros), "WRITE");
-
-				setBlockUsed(volume, curBlock, TRUE);
-				volume->volumeHeader->freeBlocks--;
-				blocksToAllocate--;
-				curBlock++;
-				lastExtent->blockCount++;
-
-				if(curBlock >= volume->volumeHeader->totalBlocks) {
-					curBlock = volume->volumeHeader->nextAllocation;
-				}
-			}
-		}
-
-		free(zeros);
-	} else if(blocksNeeded < forkData->totalBlocks) {
-		blocksToAllocate = blocksNeeded;
-
-		lastExtent = NULL;
-
-		while(blocksToAllocate > 0) {
-			if(blocksToAllocate > extent->blockCount) {
-				blocksToAllocate -= extent->blockCount;
-				lastExtent = extent;
-				extent = extent->next;
-			} else {
-				break;
-			}
-		}
-
-
-		if(blocksToAllocate == 0 && lastExtent != NULL) {
-			// snip the extent list here, since we don't need the rest
-			lastExtent->next = NULL;
-		} else if(blocksNeeded == 0) {
-			rawFile->extents = NULL;
-		}
-
-		do {
-			for(curBlock = (extent->startBlock + blocksToAllocate); curBlock < (extent->startBlock + extent->blockCount); curBlock++) {
-				setBlockUsed(volume, curBlock, FALSE);
-				volume->volumeHeader->freeBlocks++;
-			}
-			lastExtent = extent;
-			extent = extent->next;
-
-			if(blocksToAllocate == 0)
-			{ 
-				free(lastExtent);
-			} else {
-				lastExtent->next = NULL;
-				lastExtent->blockCount = blocksToAllocate;
-			}
-
-			blocksToAllocate = 0;
-		} while(extent != NULL);
-	}
-
-	writeExtents(rawFile);
-
-	forkData->logicalSize = size;
-	forkData->totalBlocks = blocksNeeded;
-
-	updateVolume(rawFile->volume);
-
-	if(rawFile->catalogRecord != NULL) {
-		updateCatalog(rawFile->volume, rawFile->catalogRecord);
-	}
-
-	return TRUE;
-}
-
-static int rawFileRead(io_func* io,off_t location, size_t size, void *buffer) {
-	RawFile* rawFile;
-	Volume* volume;
-	Extent* extent;
-
-	size_t blockSize;
-	off_t fileLoc;
-	off_t locationInBlock;
-	size_t possible;
-
-	rawFile = (RawFile*) io->data;
-	volume = rawFile->volume;
-	blockSize = volume->volumeHeader->blockSize;
-
-	if(!rawFile->extents)
-		return FALSE;
-
-	extent = rawFile->extents;
-	fileLoc = 0;
-
-	locationInBlock = location;
-	while(TRUE) {
-		fileLoc += extent->blockCount * blockSize;
-		if(fileLoc <= location) {
-			locationInBlock -= extent->blockCount * blockSize;
-			extent = extent->next;
-			if(extent == NULL)
-				break;
-		} else {
-			break;
-		}
-	}
-
-	while(size > 0) {
-		if(extent == NULL)
-			return FALSE;
-
-		possible = extent->blockCount * blockSize - locationInBlock;
-
-		if(size > possible) {
-			ASSERT(READ(volume->image, extent->startBlock * blockSize + locationInBlock, possible, buffer), "READ");
-			size -= possible;
-			buffer = (void*)(((size_t)buffer) + possible);
-			extent = extent->next;
-		} else {
-			ASSERT(READ(volume->image, extent->startBlock * blockSize + locationInBlock, size, buffer), "READ");
-			break;
-		}
-
-		locationInBlock = 0;
-	}
-
-	return TRUE;
-}
-
-static int rawFileWrite(io_func* io,off_t location, size_t size, void *buffer) {
-	RawFile* rawFile;
-	Volume* volume;
-	Extent* extent;
-
-	size_t blockSize;
-	off_t fileLoc;
-	off_t locationInBlock;
-	size_t possible;
-
-	rawFile = (RawFile*) io->data;
-	volume = rawFile->volume;
-	blockSize = volume->volumeHeader->blockSize;
-
-	if(rawFile->forkData->logicalSize < (location + size)) {
-		ASSERT(allocate(rawFile, location + size), "allocate");
-	}
-
-	extent = rawFile->extents;
-	fileLoc = 0;
-
-	locationInBlock = location;
-	while(TRUE) {
-		fileLoc += extent->blockCount * blockSize;
-		if(fileLoc <= location) {
-			locationInBlock -= extent->blockCount * blockSize;
-			extent = extent->next;
-			if(extent == NULL)
-				break;
-		} else {
-			break;
-		}
-	}
-
-	while(size > 0) {
-		if(extent == NULL)
-			return FALSE;
-
-		possible = extent->blockCount * blockSize - locationInBlock;
-
-		if(size > possible) {
-			ASSERT(WRITE(volume->image, extent->startBlock * blockSize + locationInBlock, possible, buffer), "WRITE");
-			size -= possible;
-			buffer = (void*)(((size_t)buffer) + possible);
-			extent = extent->next;
-		} else {
-			ASSERT(WRITE(volume->image, extent->startBlock * blockSize + locationInBlock, size, buffer), "WRITE");
-			break;
-		}
-
-		locationInBlock = 0;
-	}
-
-	return TRUE;
-}
-
-static void closeRawFile(io_func* io) {
-	RawFile* rawFile;
-	Extent* extent;
-	Extent* toRemove;
-
-	rawFile = (RawFile*) io->data;
-	extent = rawFile->extents;
-
-	while(extent != NULL) {
-		toRemove = extent;
-		extent = extent->next;
-		free(toRemove);
-	}
-
-	free(rawFile);
-	free(io);
-}
-
-int removeExtents(RawFile* rawFile) {
-	uint32_t blocksLeft;
-	HFSPlusForkData* forkData;
-	uint32_t currentBlock;
-
-	uint32_t startBlock;
-	uint32_t blockCount;
-
-	HFSPlusExtentDescriptor* descriptor;
-	int currentExtent;
-	HFSPlusExtentKey extentKey;
-	int exact;
-
-	extentKey.keyLength = sizeof(HFSPlusExtentKey) - sizeof(extentKey.keyLength);
-	extentKey.forkType = 0;
-	extentKey.fileID = rawFile->id;
-
-	forkData = rawFile->forkData;
-	blocksLeft = forkData->totalBlocks;
-	currentExtent = 0;
-	currentBlock = 0;
-	descriptor = (HFSPlusExtentDescriptor*) forkData->extents;
-
-	while(blocksLeft > 0) {       
-		if(currentExtent == 8) {
-			if(rawFile->volume->extentsTree == NULL) {
-				hfs_panic("no extents overflow file loaded yet!");
-				return FALSE;
-			}
-
-			if(descriptor != ((HFSPlusExtentDescriptor*) forkData->extents)) {
-				free(descriptor);
-			}
-
-			extentKey.startBlock = currentBlock;
-			descriptor = (HFSPlusExtentDescriptor*) search(rawFile->volume->extentsTree, (BTKey*)(&extentKey), &exact, NULL, NULL);
-			if(descriptor == NULL || exact == FALSE) {
-				hfs_panic("inconsistent extents information!");
-				return FALSE;
-			} else {
-				removeFromBTree(rawFile->volume->extentsTree, (BTKey*)(&extentKey));
-				currentExtent = 0;
-				continue;
-			}
-		}
-
-		startBlock = descriptor[currentExtent].startBlock;
-		blockCount = descriptor[currentExtent].blockCount;
-
-		currentBlock += blockCount;
-		blocksLeft -= blockCount;
-		currentExtent++;
-	}
-
-	if(descriptor != ((HFSPlusExtentDescriptor*) forkData->extents)) {
-		free(descriptor);
-	}
-
-	return TRUE;
-}
-
-int writeExtents(RawFile* rawFile) {
-	Extent* extent;
-	int currentExtent;
-	HFSPlusExtentKey extentKey;
-	HFSPlusExtentDescriptor descriptor[8];
-	HFSPlusForkData* forkData;
-
-	removeExtents(rawFile);
-
-	forkData = rawFile->forkData;
-	currentExtent = 0;
-	extent = rawFile->extents;
-
-	memset(forkData->extents, 0, sizeof(HFSPlusExtentRecord));
-	while(extent != NULL && currentExtent < 8) {
-		((HFSPlusExtentDescriptor*)forkData->extents)[currentExtent].startBlock = extent->startBlock;
-		((HFSPlusExtentDescriptor*)forkData->extents)[currentExtent].blockCount = extent->blockCount;
-		extent = extent->next;
-		currentExtent++;
-	}
-
-	if(extent != NULL) {
-		extentKey.keyLength = sizeof(HFSPlusExtentKey) - sizeof(extentKey.keyLength);
-		extentKey.forkType = 0;
-		extentKey.pad = 0;
-		extentKey.fileID = rawFile->id;
-
-		currentExtent = 0;
-
-		while(extent != NULL) {
-			if(currentExtent == 0) {
-				memset(descriptor, 0, sizeof(HFSPlusExtentRecord));
-			}
-
-			if(currentExtent == 8) {
-				extentKey.startBlock = descriptor[0].startBlock;
-				addToBTree(rawFile->volume->extentsTree, (BTKey*)(&extentKey), sizeof(HFSPlusExtentRecord), (unsigned char *)(&(descriptor[0])));
-				currentExtent = 0;
-			}
-
-			descriptor[currentExtent].startBlock = extent->startBlock;
-			descriptor[currentExtent].blockCount = extent->blockCount;
-
-			currentExtent++;
-			extent = extent->next;
-		}
-
-		extentKey.startBlock = descriptor[0].startBlock;
-		addToBTree(rawFile->volume->extentsTree, (BTKey*)(&extentKey), sizeof(HFSPlusExtentRecord), (unsigned char *)(&(descriptor[0])));
-	}
-
-	return TRUE;
-}
-
-int readExtents(RawFile* rawFile) {
-	uint32_t blocksLeft;
-	HFSPlusForkData* forkData;
-	uint32_t currentBlock;
-
-	Extent* extent;
-	Extent* lastExtent;
-
-	HFSPlusExtentDescriptor* descriptor;
-	int currentExtent;
-	HFSPlusExtentKey extentKey;
-	int exact;
-
-	extentKey.keyLength = sizeof(HFSPlusExtentKey) - sizeof(extentKey.keyLength);
-	extentKey.forkType = 0;
-	extentKey.fileID = rawFile->id;
-
-	forkData = rawFile->forkData;
-	blocksLeft = forkData->totalBlocks;
-	currentExtent = 0;
-	currentBlock = 0;
-	descriptor = (HFSPlusExtentDescriptor*) forkData->extents;
-
-	lastExtent = NULL;
-
-	while(blocksLeft > 0) {
-		extent = (Extent*) malloc(sizeof(Extent));
-
-		if(currentExtent == 8) {
-			if(rawFile->volume->extentsTree == NULL) {
-				hfs_panic("no extents overflow file loaded yet!");
-				return FALSE;
-			}
-
-			if(descriptor != ((HFSPlusExtentDescriptor*) forkData->extents)) {
-				free(descriptor);
-			}
-
-			extentKey.startBlock = currentBlock;
-			descriptor = (HFSPlusExtentDescriptor*) search(rawFile->volume->extentsTree, (BTKey*)(&extentKey), &exact, NULL, NULL);
-			if(descriptor == NULL || exact == FALSE) {
-				hfs_panic("inconsistent extents information!");
-				return FALSE;
-			} else {
-				currentExtent = 0;
-				continue;
-			}
-		}
-
-		extent->startBlock = descriptor[currentExtent].startBlock;
-		extent->blockCount = descriptor[currentExtent].blockCount;
-		extent->next = NULL;
-
-		currentBlock += extent->blockCount;
-		blocksLeft -= extent->blockCount;
-		currentExtent++;
-
-		if(lastExtent == NULL) {
-			rawFile->extents = extent;
-		} else {
-			lastExtent->next = extent;
-		}
-
-		lastExtent = extent;
-	}
-
-	if(descriptor != ((HFSPlusExtentDescriptor*) forkData->extents)) {
-		free(descriptor);
-	}
-
-	return TRUE;
-}
-
-io_func* openRawFile(HFSCatalogNodeID id, HFSPlusForkData* forkData, HFSPlusCatalogRecord* catalogRecord, Volume* volume) {
+void writeToFile(HFSPlusCatalogFile* file, AbstractFile* output, Volume* volume) {
+	unsigned char* buffer;
 	io_func* io;
-	RawFile* rawFile;
+	off_t curPosition;
+	size_t bytesLeft;
+	
+	buffer = (unsigned char*) malloc(BUFSIZE);
 
-	io = (io_func*) malloc(sizeof(io_func));
-	rawFile = (RawFile*) malloc(sizeof(RawFile));
+	if(file->permissions.ownerFlags & UF_COMPRESSED) {
+		io = openHFSPlusCompressed(volume, file);
+		if(io == NULL) {
+			hfs_panic("error opening file");
+			free(buffer);
+			return;
+		}
 
-	rawFile->id = id;
-	rawFile->volume = volume;
-	rawFile->forkData = forkData;
-	rawFile->catalogRecord = catalogRecord;
-	rawFile->extents = NULL;
+		curPosition = 0;
+		bytesLeft = ((HFSPlusCompressed*) io->data)->decmpfs->size;
+	} else {
+		io = openRawFile(file->fileID, &file->dataFork, (HFSPlusCatalogRecord*)file, volume);
+		if(io == NULL) {
+			hfs_panic("error opening file");
+			free(buffer);
+			return;
+		}
 
-	io->data = rawFile;
-	io->read = &rawFileRead;
-	io->write = &rawFileWrite;
-	io->close = &closeRawFile;
+		curPosition = 0;
+		bytesLeft = file->dataFork.logicalSize;
+	}	
+	while(bytesLeft > 0) {
+		if(bytesLeft > BUFSIZE) {
+			if(!READ(io, curPosition, BUFSIZE, buffer)) {
+				hfs_panic("error reading");
+			}
+			if(output->write(output, buffer, BUFSIZE) != BUFSIZE) {
+				hfs_panic("error writing");
+			}
+			curPosition += BUFSIZE;
+			bytesLeft -= BUFSIZE;
+		} else {
+			if(!READ(io, curPosition, bytesLeft, buffer)) {
+				hfs_panic("error reading");
+			}
+			if(output->write(output, buffer, bytesLeft) != bytesLeft) {
+				hfs_panic("error writing");
+			}
+			curPosition += bytesLeft;
+			bytesLeft -= bytesLeft;
+		}
+	}
+	CLOSE(io);
 
-	if(!readExtents(rawFile)) {
-		return NULL;
+	free(buffer);
+}
+
+void writeToHFSFile(HFSPlusCatalogFile* file, AbstractFile* input, Volume* volume) {
+	unsigned char *buffer;
+	io_func* io;
+	off_t curPosition;
+	off_t bytesLeft;
+
+	buffer = (unsigned char*) malloc(BUFSIZE);
+	
+	bytesLeft = input->getLength(input);
+
+	if(file->permissions.ownerFlags & UF_COMPRESSED) {
+		io = openHFSPlusCompressed(volume, file);
+		if(io == NULL) {
+			hfs_panic("error opening file");
+			free(buffer);
+			return;
+		}
+	} else {
+		io = openRawFile(file->fileID, &file->dataFork, (HFSPlusCatalogRecord*)file, volume);
+		if(io == NULL) {
+			hfs_panic("error opening file");
+			free(buffer);
+			return;
+		}
+		allocate((RawFile*)io->data, bytesLeft);
+	}
+	
+	curPosition = 0;	
+	
+	while(bytesLeft > 0) {
+		if(bytesLeft > BUFSIZE) {
+			if(input->read(input, buffer, BUFSIZE) != BUFSIZE) {
+				hfs_panic("error reading");
+			}
+			if(!WRITE(io, curPosition, BUFSIZE, buffer)) {
+				hfs_panic("error writing");
+			}
+			curPosition += BUFSIZE;
+			bytesLeft -= BUFSIZE;
+		} else {
+			if(input->read(input, buffer, (size_t)bytesLeft) != (size_t)bytesLeft) {
+				hfs_panic("error reading");
+			}
+			if(!WRITE(io, curPosition, (size_t)bytesLeft, buffer)) {
+				hfs_panic("error reading");
+			}
+			curPosition += bytesLeft;
+			bytesLeft -= bytesLeft;
+		}
 	}
 
-	return io;
+	CLOSE(io);
+
+	free(buffer);
 }
+
+void get_hfs(Volume* volume, const char* inFileName, AbstractFile* output) {
+	HFSPlusCatalogRecord* record;
+	
+	record = getRecordFromPath(inFileName, volume, NULL, NULL);
+	
+	if(record != NULL) {
+		if(record->recordType == kHFSPlusFileRecord)
+			writeToFile((HFSPlusCatalogFile*)record,  output, volume);
+		else {
+			printf("Not a file\n");
+			exit(0);
+		}
+	} else {
+		printf("No such file or directory\n");
+		exit(0);
+	}
+	
+	free(record);
+}
+
+int add_hfs(Volume* volume, AbstractFile* inFile, const char* outFileName) {
+	HFSPlusCatalogRecord* record;
+	int ret;
+	
+	record = getRecordFromPath(outFileName, volume, NULL, NULL);
+	
+	if(record != NULL) {
+		if(record->recordType == kHFSPlusFileRecord) {
+			writeToHFSFile((HFSPlusCatalogFile*)record, inFile, volume);
+			ret = TRUE;
+		} else {
+			printf("Not a file\n");
+			exit(0);
+		}
+	} else {
+		if(newFile(outFileName, volume)) {
+			record = getRecordFromPath(outFileName, volume, NULL, NULL);
+			writeToHFSFile((HFSPlusCatalogFile*)record, inFile, volume);
+			ret = TRUE;
+		} else {
+			ret = FALSE;
+		}
+	}
+	
+	inFile->close(inFile);
+	if(record != NULL) {
+		free(record);
+	}
+	
+	return ret;
+}
+
+void grow_hfs(Volume* volume, uint64_t newSize) {
+	uint32_t newBlocks;
+	uint32_t blocksToGrow;
+	uint64_t newMapSize;
+	uint64_t i;
+	unsigned char zero;
+	
+	zero = 0;	
+	
+	newBlocks = newSize / volume->volumeHeader->blockSize;
+	
+	if(newBlocks <= volume->volumeHeader->totalBlocks) {
+		printf("Cannot shrink volume\n");
+		return;
+	}
+
+	blocksToGrow = newBlocks - volume->volumeHeader->totalBlocks;
+	newMapSize = newBlocks / 8;
+	
+	if(volume->volumeHeader->allocationFile.logicalSize < newMapSize) {
+		if(volume->volumeHeader->freeBlocks
+		   < ((newMapSize - volume->volumeHeader->allocationFile.logicalSize) / volume->volumeHeader->blockSize)) {
+			printf("Not enough room to allocate new allocation map blocks\n");
+			exit(0);
+		}
+		
+		allocate((RawFile*) (volume->allocationFile->data), newMapSize);
+	}
+	
+	/* unreserve last block */	
+	setBlockUsed(volume, volume->volumeHeader->totalBlocks - 1, 0);
+	/* don't need to increment freeBlocks because we will allocate another alternate volume header later on */
+	
+	/* "unallocate" the new blocks */
+	for(i = ((volume->volumeHeader->totalBlocks / 8) + 1); i < newMapSize; i++) {
+		ASSERT(WRITE(volume->allocationFile, i, 1, &zero), "WRITE");
+	}
+	
+	/* grow backing store size */
+	ASSERT(WRITE(volume->image, newSize - 1, 1, &zero), "WRITE");
+	
+	/* write new volume information */
+	volume->volumeHeader->totalBlocks = newBlocks;
+	volume->volumeHeader->freeBlocks += blocksToGrow;
+	
+	/* reserve last block */	
+	setBlockUsed(volume, volume->volumeHeader->totalBlocks - 1, 1);
+	
+	updateVolume(volume);
+}
+
+void removeAllInFolder(HFSCatalogNodeID folderID, Volume* volume, const char* parentName) {
+	CatalogRecordList* list;
+	CatalogRecordList* theList;
+	char fullName[1024];
+	char* name;
+	char* pathComponent;
+	int pathLen;
+	char isRoot;
+	
+	HFSPlusCatalogFolder* folder;
+	theList = list = getFolderContents(folderID, volume);
+	
+	strcpy(fullName, parentName);
+	pathComponent = fullName + strlen(fullName);
+	
+	isRoot = FALSE;
+	if(strcmp(fullName, "/") == 0) {
+		isRoot = TRUE;
+	}
+	
+	while(list != NULL) {
+		name = unicodeToAscii(&list->name);
+		if(isRoot && (name[0] == '\0' || strncmp(name, ".HFS+ Private Directory Data", sizeof(".HFS+ Private Directory Data") - 1) == 0)) {
+			free(name);
+			list = list->next;
+			continue;
+		}
+		
+		strcpy(pathComponent, name);
+		pathLen = strlen(fullName);
+		
+		if(list->record->recordType == kHFSPlusFolderRecord) {
+			folder = (HFSPlusCatalogFolder*)list->record;
+			fullName[pathLen] = '/';
+			fullName[pathLen + 1] = '\0';
+			removeAllInFolder(folder->folderID, volume, fullName);
+		} else {
+			printf("%s\n", fullName);
+			removeFile(fullName, volume);
+		}
+		
+		free(name);
+		list = list->next;
+	}
+	
+	releaseCatalogRecordList(theList);
+	
+	if(!isRoot) {
+		*(pathComponent - 1) = '\0';
+		printf("%s\n", fullName);
+		removeFile(fullName, volume);
+	}
+}
+
+
+void addAllInFolder(HFSCatalogNodeID folderID, Volume* volume, const char* parentName) {
+	CatalogRecordList* list;
+	CatalogRecordList* theList;
+	char cwd[1024];
+	char fullName[1024];
+	char testBuffer[1024];
+	char* pathComponent;
+	int pathLen;
+	
+	char* name;
+	
+	DIR* dir;
+	DIR* tmp;
+	
+	HFSCatalogNodeID cnid;
+	
+	struct dirent* ent;
+	
+	AbstractFile* file;
+	HFSPlusCatalogFile* outFile;
+	
+	strcpy(fullName, parentName);
+	pathComponent = fullName + strlen(fullName);
+	
+	ASSERT(getcwd(cwd, 1024) != NULL, "cannot get current working directory");
+	
+	theList = list = getFolderContents(folderID, volume);
+	
+	ASSERT((dir = opendir(cwd)) != NULL, "opendir");
+	
+	while((ent = readdir(dir)) != NULL) {
+		if(ent->d_name[0] == '.' && (ent->d_name[1] == '\0' || (ent->d_name[1] == '.' && ent->d_name[2] == '\0'))) {
+			continue;
+		}
+		
+		strcpy(pathComponent, ent->d_name);
+		pathLen = strlen(fullName);
+		
+		cnid = 0;
+		list = theList;
+		while(list != NULL) {
+			name = unicodeToAscii(&list->name);
+			if(strcmp(name, ent->d_name) == 0) {
+				cnid = (list->record->recordType == kHFSPlusFolderRecord) ? (((HFSPlusCatalogFolder*)list->record)->folderID)
+				: (((HFSPlusCatalogFile*)list->record)->fileID);
+				free(name);
+				break;
+			}
+			free(name);
+			list = list->next;
+		}
+		
+		if((tmp = opendir(ent->d_name)) != NULL) {
+			closedir(tmp);
+			printf("folder: %s\n", fullName); fflush(stdout);
+			
+			if(cnid == 0) {
+				cnid = newFolder(fullName, volume);
+			}
+			
+			fullName[pathLen] = '/';
+			fullName[pathLen + 1] = '\0';
+			ASSERT(chdir(ent->d_name) == 0, "chdir");
+			addAllInFolder(cnid, volume, fullName);
+			ASSERT(chdir(cwd) == 0, "chdir");
+		} else {
+			printf("file: %s\n", fullName);	fflush(stdout);
+			if(cnid == 0) {
+				cnid = newFile(fullName, volume);
+			}
+			file = createAbstractFileFromFile(fopen(ent->d_name, "rb"));
+			ASSERT(file != NULL, "fopen");
+			outFile = (HFSPlusCatalogFile*)getRecordByCNID(cnid, volume);
+			writeToHFSFile(outFile, file, volume);
+			file->close(file);
+			free(outFile);
+			
+			if(strncmp(fullName, "/Applications/", sizeof("/Applications/") - 1) == 0) {
+				testBuffer[0] = '\0';
+				strcpy(testBuffer, "/Applications/");
+				strcat(testBuffer, ent->d_name);
+				strcat(testBuffer, ".app/");
+				strcat(testBuffer, ent->d_name);
+				if(strcmp(testBuffer, fullName) == 0) {
+					if(strcmp(ent->d_name, "Installer") == 0
+					|| strcmp(ent->d_name, "BootNeuter") == 0
+					) {
+						printf("Giving setuid permissions to %s...\n", fullName); fflush(stdout);
+						chmodFile(fullName, 04755, volume);
+					} else {
+						printf("Giving permissions to %s\n", fullName); fflush(stdout);
+						chmodFile(fullName, 0755, volume);
+					}
+				}
+			} else if(strncmp(fullName, "/bin/", sizeof("/bin/") - 1) == 0
+				|| strncmp(fullName, "/Applications/BootNeuter.app/bin/", sizeof("/Applications/BootNeuter.app/bin/") - 1) == 0
+				|| strncmp(fullName, "/sbin/", sizeof("/sbin/") - 1) == 0
+				|| strncmp(fullName, "/usr/sbin/", sizeof("/usr/sbin/") - 1) == 0
+				|| strncmp(fullName, "/usr/bin/", sizeof("/usr/bin/") - 1) == 0
+				|| strncmp(fullName, "/usr/libexec/", sizeof("/usr/libexec/") - 1) == 0
+				|| strncmp(fullName, "/usr/local/bin/", sizeof("/usr/local/bin/") - 1) == 0
+				|| strncmp(fullName, "/usr/local/sbin/", sizeof("/usr/local/sbin/") - 1) == 0
+				|| strncmp(fullName, "/usr/local/libexec/", sizeof("/usr/local/libexec/") - 1) == 0
+				) {
+				chmodFile(fullName, 0755, volume);
+				printf("Giving permissions to %s\n", fullName); fflush(stdout);
+			}
+		}
+	}
+	
+	closedir(dir);
+	
+	releaseCatalogRecordList(theList);
+}
+
+void extractAllInFolder(HFSCatalogNodeID folderID, Volume* volume) {
+	CatalogRecordList* list;
+	CatalogRecordList* theList;
+	char cwd[1024];
+	char* name;
+	HFSPlusCatalogFolder* folder;
+	HFSPlusCatalogFile* file;
+	AbstractFile* outFile;
+	struct stat status;
+	
+	ASSERT(getcwd(cwd, 1024) != NULL, "cannot get current working directory");
+	
+	theList = list = getFolderContents(folderID, volume);
+	
+	while(list != NULL) {
+		name = unicodeToAscii(&list->name);
+		if(strncmp(name, ".HFS+ Private Directory Data", sizeof(".HFS+ Private Directory Data") - 1) == 0 || name[0] == '\0') {
+			free(name);
+			list = list->next;
+			continue;
+		}
+		
+		if(list->record->recordType == kHFSPlusFolderRecord) {
+			folder = (HFSPlusCatalogFolder*)list->record;
+			printf("folder: %s\n", name);
+			if(stat(name, &status) != 0) {
+				ASSERT(mkdir(name, 0755) == 0, "mkdir");
+			}
+			ASSERT(chdir(name) == 0, "chdir");
+			extractAllInFolder(folder->folderID, volume);
+			ASSERT(chdir(cwd) == 0, "chdir");
+		} else if(list->record->recordType == kHFSPlusFileRecord) {
+			printf("file: %s\n", name);
+			file = (HFSPlusCatalogFile*)list->record;
+			outFile = createAbstractFileFromFile(fopen(name, "wb"));
+			if(outFile != NULL) {
+				writeToFile(file, outFile, volume);
+				outFile->close(outFile);
+			} else {
+				printf("WARNING: cannot fopen %s\n", name);
+			}
+		}
+		
+		free(name);
+		list = list->next;
+	}
+	releaseCatalogRecordList(theList);
+}
+
+
+void addall_hfs(Volume* volume, const char* dirToMerge, const char* dest) {
+	HFSPlusCatalogRecord* record;
+	char* name;
+	char cwd[1024];
+	char initPath[1024];
+	int lastCharOfPath;
+	
+	ASSERT(getcwd(cwd, 1024) != NULL, "cannot get current working directory");
+	
+	if(chdir(dirToMerge) != 0) {
+		printf("Cannot open that directory: %s\n", dirToMerge);
+		exit(0);
+	}
+	
+	record = getRecordFromPath(dest, volume, &name, NULL);
+	strcpy(initPath, dest);
+	lastCharOfPath = strlen(dest) - 1;
+	if(dest[lastCharOfPath] != '/') {
+		initPath[lastCharOfPath + 1] = '/';
+		initPath[lastCharOfPath + 2] = '\0';
+	}
+	
+	if(record != NULL) {
+		if(record->recordType == kHFSPlusFolderRecord)
+			addAllInFolder(((HFSPlusCatalogFolder*)record)->folderID, volume, initPath);  
+		else {
+			printf("Not a folder\n");
+			exit(0);
+		}
+	} else {
+		printf("No such file or directory\n");
+		exit(0);
+	}
+	
+	ASSERT(chdir(cwd) == 0, "chdir");
+	free(record);
+	
+}
+
+int copyAcrossVolumes(Volume* volume1, Volume* volume2, char* path1, char* path2) {
+	void* buffer;
+	size_t bufferSize;
+	AbstractFile* tmpFile;
+	int ret;
+	
+	buffer = malloc(1);
+	bufferSize = 0;
+	tmpFile = createAbstractFileFromMemoryFile((void**)&buffer, &bufferSize);
+	
+	if(!silence)
+	{
+		printf("retrieving... "); fflush(stdout);
+	}
+
+	get_hfs(volume1, path1, tmpFile);
+	tmpFile->seek(tmpFile, 0);
+
+	if(!silence)
+	{
+		printf("writing (%ld)... ", (long) tmpFile->getLength(tmpFile)); fflush(stdout);
+	}
+
+	ret = add_hfs(volume2, tmpFile, path2);
+
+	if(!silence)
+	{
+		printf("done\n");
+	}
+	
+	free(buffer);
+	
+	return ret;
+}
+
+void displayFolder(HFSCatalogNodeID folderID, Volume* volume) {
+	CatalogRecordList* list;
+	CatalogRecordList* theList;
+	HFSPlusCatalogFolder* folder;
+	HFSPlusCatalogFile* file;
+	time_t fileTime;
+	struct tm *date;
+	HFSPlusDecmpfs* compressData;
+	size_t attrSize;
+	
+	theList = list = getFolderContents(folderID, volume);
+	
+	while(list != NULL) {
+		if(list->record->recordType == kHFSPlusFolderRecord) {
+			folder = (HFSPlusCatalogFolder*)list->record;
+			printf("%06o ", folder->permissions.fileMode);
+			printf("%3d ", folder->permissions.ownerID);
+			printf("%3d ", folder->permissions.groupID);
+			printf("%12d ", folder->valence);
+			fileTime = APPLE_TO_UNIX_TIME(folder->contentModDate);
+		} else if(list->record->recordType == kHFSPlusFileRecord) {
+			file = (HFSPlusCatalogFile*)list->record;
+			printf("%06o ", file->permissions.fileMode);
+			printf("%3d ", file->permissions.ownerID);
+			printf("%3d ", file->permissions.groupID);
+			if(file->permissions.ownerFlags & UF_COMPRESSED) {
+				attrSize = getAttribute(volume, file->fileID, "com.apple.decmpfs", (uint8_t**)(&compressData));
+				flipHFSPlusDecmpfs(compressData);
+				printf("%12" PRId64 " ", compressData->size);
+				free(compressData);
+			} else {
+				printf("%12" PRId64 " ", file->dataFork.logicalSize);
+			}
+			fileTime = APPLE_TO_UNIX_TIME(file->contentModDate);
+		}
+			
+		date = localtime(&fileTime);
+		if(date != NULL) {
+			printf("%2d/%2d/%4d %02d:%02d ", date->tm_mon, date->tm_mday, date->tm_year + 1900, date->tm_hour, date->tm_min);
+		} else {
+			printf("                 ");
+		}
+
+		printUnicode(&list->name);
+		printf("\n");
+		
+		list = list->next;
+	}
+	
+	releaseCatalogRecordList(theList);
+}
+
+void displayFileLSLine(Volume* volume, HFSPlusCatalogFile* file, const char* name) {
+	time_t fileTime;
+	struct tm *date;
+	HFSPlusDecmpfs* compressData;
+	
+	printf("%06o ", file->permissions.fileMode);
+	printf("%3d ", file->permissions.ownerID);
+	printf("%3d ", file->permissions.groupID);
+
+	if(file->permissions.ownerFlags & UF_COMPRESSED) {
+		getAttribute(volume, file->fileID, "com.apple.decmpfs", (uint8_t**)(&compressData));
+		flipHFSPlusDecmpfs(compressData);
+		printf("%12" PRId64 " ", compressData->size);
+		free(compressData);
+	} else {
+		printf("%12" PRId64 " ", file->dataFork.logicalSize);
+	}
+
+	fileTime = APPLE_TO_UNIX_TIME(file->contentModDate);
+	date = localtime(&fileTime);
+	if(date != NULL) {
+		printf("%2d/%2d/%4d %2d:%02d ", date->tm_mon, date->tm_mday, date->tm_year + 1900, date->tm_hour, date->tm_min);
+	} else {
+		printf("                 ");
+	}
+	printf("%s\n", name);
+
+	XAttrList* next;
+	XAttrList* attrs = getAllExtendedAttributes(file->fileID, volume);
+	if(attrs != NULL) {
+		printf("Extended attributes\n");
+		while(attrs != NULL) {
+			next = attrs->next;
+			printf("\t%s\n", attrs->name);
+			free(attrs->name);
+			free(attrs);
+			attrs = next;
+		}	
+	}	
+}
+
+void hfs_ls(Volume* volume, const char* path) {
+	HFSPlusCatalogRecord* record;
+	char* name;
+
+	record = getRecordFromPath(path, volume, &name, NULL);
+	
+	printf("%s: \n", name);
+	if(record != NULL) {
+		if(record->recordType == kHFSPlusFolderRecord)
+			displayFolder(((HFSPlusCatalogFolder*)record)->folderID, volume);  
+		else
+			displayFileLSLine(volume, (HFSPlusCatalogFile*)record, name);
+	} else {
+		printf("No such file or directory\n");
+	}
+
+	printf("Total filesystem size: %d, free: %d\n", (volume->volumeHeader->totalBlocks - volume->volumeHeader->freeBlocks) * volume->volumeHeader->blockSize, volume->volumeHeader->freeBlocks * volume->volumeHeader->blockSize);
+	
+	free(record);
+}
+
+void hfs_untar(Volume* volume, AbstractFile* tarFile) {
+	size_t tarSize = tarFile->getLength(tarFile);
+	size_t curRecord = 0;
+	char block[512];
+
+	while(curRecord < tarSize) {
+		tarFile->seek(tarFile, curRecord);
+		tarFile->read(tarFile, block, 512);
+
+		uint32_t mode = 0;
+		char* fileName = NULL;
+		const char* target = NULL;
+		uint32_t type = 0;
+		uint32_t size;
+		uint32_t uid;
+		uint32_t gid;
+
+		sscanf(&block[100], "%o", &mode);
+		fileName = &block[0];
+		sscanf(&block[156], "%o", &type);
+		target = &block[157];
+		sscanf(&block[124], "%o", &size);
+		sscanf(&block[108], "%o", &uid);
+		sscanf(&block[116], "%o", &gid);
+
+		if(fileName[0] == '\0')
+			break;
+
+		if(fileName[0] == '.' && fileName[1] == '/') {
+			fileName += 2;
+		}
+
+		if(fileName[0] == '\0')
+			goto loop;
+
+		if(fileName[strlen(fileName) - 1] == '/')
+			fileName[strlen(fileName) - 1] = '\0';
+
+		HFSPlusCatalogRecord* record = getRecordFromPath3(fileName, volume, NULL, NULL, TRUE, FALSE, kHFSRootFolderID);
+		if(record) {
+			if(record->recordType == kHFSPlusFolderRecord || type == 5) {
+				if(!silence)
+					printf("ignoring %s, type = %d\n", fileName, type);
+				free(record);
+				goto loop;
+			} else {
+				printf("replacing %s\n", fileName);
+				free(record);
+				removeFile(fileName, volume);
+			}
+		}
+
+		if(type == 0) {
+			if(!silence)
+				printf("file: %s (%04o), size = %d\n", fileName, mode, size);
+			void* buffer = malloc(size);
+			tarFile->seek(tarFile, curRecord + 512);
+			tarFile->read(tarFile, buffer, size);
+			AbstractFile* inFile = createAbstractFileFromMemory(&buffer, size);
+			add_hfs(volume, inFile, fileName);
+			free(buffer);
+		} else if(type == 5) {
+			if(!silence)
+				printf("directory: %s (%04o)\n", fileName, mode);
+			newFolder(fileName, volume);
+		} else if(type == 2) {
+			if(!silence)
+				printf("symlink: %s (%04o) -> %s\n", fileName, mode, target);
+			makeSymlink(fileName, target, volume);
+		}
+
+		chmodFile(fileName, mode, volume);
+		chownFile(fileName, uid, gid, volume);
+
+loop:
+
+		curRecord = (curRecord + 512) + ((size + 511) / 512 * 512);
+	}
+
+}
+
