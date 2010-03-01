@@ -375,7 +375,8 @@ void writeImg3Root(AbstractFile* file, Img3Element* element, Img3Info* info) {
 			header->extra.shshOffset = (uint32_t)(file->tell(file) - sizeof(AppleImg3RootHeader));
 		}
 
-		if(current->header->magic != IMG3_KBAG_MAGIC || info->encrypted) {
+		if(current->header->magic != IMG3_KBAG_MAGIC || info->encrypted)
+		{
 			writeImg3Element(file, current, info);
 		}
 
@@ -537,9 +538,6 @@ AbstractFile* createAbstractFileFromImg3(AbstractFile* file) {
 	info->cert = NULL;
 	info->kbag = NULL;
 	info->type = NULL;
-	info->shsh = NULL;
-	info->ecid = NULL;
-	info->encrypted = FALSE;
 
 	current = (Img3Element*) info->root->data;
 	while(current != NULL) {
@@ -551,12 +549,6 @@ AbstractFile* createAbstractFileFromImg3(AbstractFile* file) {
 		}
 		if(current->header->magic == IMG3_TYPE_MAGIC) {
 			info->type = current;
-		}
-		if(current->header->magic == IMG3_SHSH_MAGIC) {
-			info->shsh = current;
-		}
-		if(current->header->magic == IMG3_ECID_MAGIC) {
-			info->ecid = current;
 		}
 		if(current->header->magic == IMG3_KBAG_MAGIC && ((AppleImg3KBAGHeader*)current->data)->key_modifier == 1) {
 			info->kbag = current;
@@ -660,29 +652,6 @@ void replaceCertificateImg3(AbstractFile* file, AbstractFile* certificate) {
 	certificate->read(certificate, info->cert->data, info->cert->header->dataSize);
 
 	info->dirty = TRUE;
-}
-
-void replaceSignatureImg3(AbstractFile* file, AbstractFile* signature) {
-  Img3Info* info = (Img3Info*) file->data;
-  
-  size_t signature_size = signature->getLength(signature);
-  Img3Element* element = (Img3Element*) readImg3Element(signature);
-
-  int i = 0;
-  Img3Element* previous = element;
-  for (i = previous->header->size; i < signature_size; i += previous->header->size) {
-    previous->next = (Img3Element*) readImg3Element(signature);
-    previous = previous->next;
-  }
-
-  Img3Element* current = info->data;
-  while (current->next != info->shsh) {
-    current = current->next;
-  }
-
-  signature->seek(signature, 0);
-  current->next = element;
-  info->dirty = TRUE;
 }
 
 AbstractFile* duplicateImg3File(AbstractFile* file, AbstractFile* backing) {
