@@ -12,7 +12,7 @@ good starting point.
 
 2. Install some prerequisites libraries required by xpwn:
 
-	sudo apt-get install libcrypt-dev libz-dev libbz2-dev3 libusb-dev
+	sudo apt-get install libz-dev libusb-dev libssl-dev libbz2-dev libpng12-dev 
 
 3. Install cmake. It is recommended you download and build it from the
 official cmake website, since versions >= 2.6.0 are recommended.
