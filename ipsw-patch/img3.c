@@ -271,6 +271,13 @@ void closeImg3(AbstractFile* file) {
 void setKeyImg3(AbstractFile2* file, const unsigned int* key, const unsigned int* iv) {
 	Img3Info* info = (Img3Info*) file->super.data;
 
+# imported from dborca
+
+if (!info->kbag) {
+	return;
+}
+
+
 	int i;
 	uint8_t bKey[32];
 	int keyBits = ((AppleImg3KBAGHeader*)info->kbag->data)->key_bits;
