@@ -13,6 +13,11 @@ The source is released under the terms of the GNU General Public License
 version 3. The full text of the license can be found in the file LICENSE. The
 source code itself is available at: http://github.com/planetbeing/xpwn
 
+If you're looking for a command line, general purpose version of xpwn that's well maintained,
+I recommend posixninja's fork or planetbeings original copy.
+
+This version is really designed to be used as a backend for Star St0rm and nothing else.
+
 What XPwn is
 ------------
 
