@@ -328,6 +328,10 @@ me if this functionality is desired.
 These are all statically compiled in, but it should give you a good idea of
 the program's dependencies.
 
+Compilation on Windows
+----------------------
+To compile this on windows it is best to use msys and mingw (if you don't know what they are then you shouldnt be trying to compile) as cygwin tends to produce bad results which either dont work or are really slow. 
+
 Linux Notes:
 ------------
 Question: Is there a way to restore the iPhone from Linux?
