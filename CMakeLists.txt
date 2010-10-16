@@ -21,7 +21,6 @@ add_subdirectory (dmg)
 add_subdirectory (hdutil)
 add_subdirectory (hfs)
 add_subdirectory (ipsw-patch)
-add_subdirectory (fwstitcher)
 
 install(FILES README.markdown DESTINATION . RENAME README.txt)
 install(FILES LICENSE DESTINATION . RENAME LICENSE.txt)
